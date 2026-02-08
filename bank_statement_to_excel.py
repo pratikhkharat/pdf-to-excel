@@ -6,11 +6,12 @@ from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 import re
 import io
 import os
+import gc
 import tempfile
 import traceback
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50 MB
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -66,31 +67,24 @@ HTML_TEMPLATE = """
         .upload-area .icon { font-size: 3rem; margin-bottom: 12px; }
         .upload-area p { color: #555; font-size: 1rem; }
         .upload-area .filename {
-            margin-top: 12px;
-            font-weight: 600;
-            color: #1F4E79;
-            font-size: 0.95rem;
+            margin-top: 12px; font-weight: 600;
+            color: #1F4E79; font-size: 0.95rem;
         }
         .upload-area input[type="file"] {
-            position: absolute;
-            top: 0; left: 0; width: 100%; height: 100%;
+            position: absolute; top: 0; left: 0;
+            width: 100%; height: 100%;
             opacity: 0; cursor: pointer;
         }
         .mode-select { display: flex; gap: 12px; margin-bottom: 24px; }
         .mode-option {
             flex: 1; padding: 14px;
-            border: 2px solid #e0e0e0;
-            border-radius: 12px;
-            text-align: center;
-            cursor: pointer;
-            transition: all 0.2s;
-            font-size: 0.9rem;
+            border: 2px solid #e0e0e0; border-radius: 12px;
+            text-align: center; cursor: pointer;
+            transition: all 0.2s; font-size: 0.9rem;
         }
         .mode-option:hover { border-color: #2E86C1; }
         .mode-option.active {
-            border-color: #1F4E79;
-            background: #eef5fb;
-            font-weight: 600;
+            border-color: #1F4E79; background: #eef5fb; font-weight: 600;
         }
         .mode-option input { display: none; }
         .btn {
@@ -105,10 +99,8 @@ HTML_TEMPLATE = """
         .progress-container { display: none; margin-top: 24px; text-align: center; }
         .spinner {
             width: 48px; height: 48px;
-            border: 4px solid #e0e0e0;
-            border-top: 4px solid #1F4E79;
-            border-radius: 50%;
-            animation: spin 0.8s linear infinite;
+            border: 4px solid #e0e0e0; border-top: 4px solid #1F4E79;
+            border-radius: 50%; animation: spin 0.8s linear infinite;
             margin: 0 auto 16px;
         }
         @keyframes spin { to { transform: rotate(360deg); } }
@@ -163,7 +155,7 @@ HTML_TEMPLATE = """
         </form>
         <div class="progress-container" id="progress">
             <div class="spinner"></div>
-            <p class="progress-text">Processing your PDF... Large files may take up to 2 minutes.</p>
+            <p class="progress-text">Processing your PDF... Large files may take 1-2 minutes.</p>
         </div>
         <div class="result" id="result">
             <h3>&#x2705; Conversion Complete!</h3>
@@ -211,7 +203,7 @@ HTML_TEMPLATE = """
             progress.style.display = 'none';
             result.style.display = 'none';
             errorDiv.style.display = 'block';
-            errorDiv.textContent = 'Error: ' + msg;
+            errorDiv.textContent = msg;
             convertBtn.disabled = false;
         }
         form.addEventListener('submit', function(e) {
@@ -223,19 +215,17 @@ HTML_TEMPLATE = """
             const formData = new FormData(form);
             fetch('/convert', { method: 'POST', body: formData })
                 .then(async response => {
-                    const contentType = response.headers.get('content-type') || '';
+                    const ct = response.headers.get('content-type') || '';
                     if (!response.ok) {
-                        if (contentType.includes('application/json')) {
-                            const data = await response.json();
-                            throw new Error(data.error || 'Unknown server error');
-                        } else {
-                            const text = await response.text();
-                            throw new Error('Server error (' + response.status + '). The PDF may be too large or in an unsupported format.');
+                        if (ct.includes('application/json')) {
+                            const d = await response.json();
+                            throw new Error(d.error || 'Server error');
                         }
+                        throw new Error('Server error (' + response.status + '). Try again or use a smaller PDF.');
                     }
-                    if (contentType.includes('application/json')) {
-                        const data = await response.json();
-                        throw new Error(data.error || 'Unknown error');
+                    if (ct.includes('application/json')) {
+                        const d = await response.json();
+                        throw new Error(d.error || 'Unknown error');
                     }
                     const txnCount = response.headers.get('X-Transaction-Count') || '?';
                     const bankName = response.headers.get('X-Bank-Name') || 'Bank';
@@ -265,6 +255,10 @@ HTML_TEMPLATE = """
 </body>
 </html>
 """
+
+# ──────────────────────────────────────────────
+#  BANK PROFILES
+# ──────────────────────────────────────────────
 
 BANK_PROFILES = {
     "icici": {
@@ -309,6 +303,9 @@ BANK_PROFILES = {
     },
 }
 
+DATE_PAT = re.compile(r'\d{2}/\w{3}/\d{2,4}|\d{2}-\w{3}-\d{2,4}|\d{2}/\d{2}/\d{2,4}|\d{2}-\d{2}-\d{2,4}')
+MONEY_PAT = re.compile(r'[\d,]+\.\d{2}')
+
 
 def detect_bank(text):
     upper = text.upper()
@@ -321,83 +318,100 @@ def detect_bank(text):
     return "generic"
 
 
+# ──────────────────────────────────────────────
+#  MEMORY-EFFICIENT PAGE-BY-PAGE EXTRACTION
+# ──────────────────────────────────────────────
+
 def extract_text_mode(pdf_path):
-    pdf = pdfplumber.open(pdf_path)
-    total_pages = len(pdf.pages)
-    sample = ""
-    for i in range(min(3, total_pages)):
-        t = pdf.pages[i].extract_text()
-        if t:
-            sample += t + "\n"
-    bank_key = detect_bank(sample)
-    profile = BANK_PROFILES[bank_key]
-    skip_keywords = profile["skip_keywords"]
-    date_pat = re.compile(r'\d{2}/\w{3}/\d{2,4}|\d{2}-\w{3}-\d{2,4}|\d{2}/\d{2}/\d{2,4}|\d{2}-\d{2}-\d{2,4}')
+    """Extract using text — processes one page at a time to save memory."""
     all_rows = []
-    for i in range(total_pages):
-        text = pdf.pages[i].extract_text()
-        if not text:
-            continue
-        for line in text.split('\n'):
-            stripped = line.strip()
-            if not stripped:
+    bank_key = "generic"
+
+    with pdfplumber.open(pdf_path) as pdf:
+        total_pages = len(pdf.pages)
+
+        # Detect bank from first page only
+        first_text = pdf.pages[0].extract_text() or ""
+        bank_key = detect_bank(first_text)
+        profile = BANK_PROFILES[bank_key]
+        skip_kw_lower = [kw.lower() for kw in profile["skip_keywords"]]
+
+        # Process page by page
+        for i in range(total_pages):
+            page = pdf.pages[i]
+            text = page.extract_text()
+            if not text:
                 continue
-            if any(kw.lower() in stripped.lower() for kw in skip_keywords):
-                continue
-            if re.match(r'^(\d+)\s+', stripped) and date_pat.search(stripped):
-                all_rows.append(stripped)
-    pdf.close()
-    return all_rows, bank_key, profile
+
+            for line in text.split('\n'):
+                stripped = line.strip()
+                if not stripped or len(stripped) < 10:
+                    continue
+                stripped_lower = stripped.lower()
+                if any(kw in stripped_lower for kw in skip_kw_lower):
+                    continue
+                if re.match(r'^(\d+)\s+', stripped) and DATE_PAT.search(stripped):
+                    all_rows.append(stripped)
+
+            # Free memory after each page
+            page.flush_cache()
+
+    gc.collect()
+    return all_rows, bank_key, BANK_PROFILES[bank_key]
 
 
 def extract_table_mode(pdf_path):
-    pdf = pdfplumber.open(pdf_path)
-    total_pages = len(pdf.pages)
-    sample = ""
-    for i in range(min(3, total_pages)):
-        t = pdf.pages[i].extract_text()
-        if t:
-            sample += t + "\n"
-    bank_key = detect_bank(sample)
-    profile = BANK_PROFILES[bank_key]
-    header_keywords = ["date", "narration", "description", "particular", "debit", "credit",
-                        "balance", "withdrawal", "deposit", "amount", "txn", "ref", "cheque",
-                        "tran", "value"]
+    """Extract using table detection — page by page."""
+    header_keywords = ["date", "narration", "description", "debit", "credit",
+                        "balance", "withdrawal", "deposit", "txn", "ref", "tran", "value"]
     all_data = []
     headers = None
-    for i in range(total_pages):
-        tables = pdf.pages[i].extract_tables()
-        for table in tables:
-            for row in table:
-                if not row or not any(cell and cell.strip() for cell in row if cell):
-                    continue
-                cleaned = [cell.strip() if cell else "" for cell in row]
-                row_text = " ".join(cleaned).lower()
-                if headers is None:
-                    if sum(1 for kw in header_keywords if kw in row_text) >= 2:
-                        headers = cleaned
+    bank_key = "generic"
+
+    with pdfplumber.open(pdf_path) as pdf:
+        first_text = pdf.pages[0].extract_text() or ""
+        bank_key = detect_bank(first_text)
+        profile = BANK_PROFILES[bank_key]
+
+        for i in range(len(pdf.pages)):
+            page = pdf.pages[i]
+            tables = page.extract_tables()
+            for table in tables:
+                for row in table:
+                    if not row or not any(cell and cell.strip() for cell in row if cell):
                         continue
-                if headers:
-                    all_data.append(cleaned)
-    pdf.close()
+                    cleaned = [cell.strip() if cell else "" for cell in row]
+                    row_text = " ".join(cleaned).lower()
+                    if headers is None:
+                        if sum(1 for kw in header_keywords if kw in row_text) >= 2:
+                            headers = cleaned
+                            continue
+                    if headers:
+                        all_data.append(cleaned)
+            page.flush_cache()
+
+    gc.collect()
     return all_data, headers, bank_key, profile
 
 
+# ──────────────────────────────────────────────
+#  PARSE TEXT ROWS
+# ──────────────────────────────────────────────
+
 def parse_text_rows(all_rows, bank_key):
-    date_pat = re.compile(r'\d{2}/\w{3}/\d{2,4}|\d{2}-\w{3}-\d{2,4}|\d{2}/\d{2}/\d{2,4}|\d{2}-\d{2}-\d{2,4}')
-    money_pat = re.compile(r'[\d,]+\.\d{2}')
     parsed = []
     for row_text in all_rows:
-        amounts = money_pat.findall(row_text)
+        amounts = MONEY_PAT.findall(row_text)
         sl_match = re.match(r'^(\d+)\s+', row_text)
         sl_no = sl_match.group(1) if sl_match else ""
         tran_match = re.search(r'(S\d{4,})\s', row_text)
         tran_id = tran_match.group(1) if tran_match else ""
-        dates = date_pat.findall(row_text)
+        dates = DATE_PAT.findall(row_text)
         value_date = dates[0] if len(dates) > 0 else ""
         txn_date = dates[1] if len(dates) > 1 else ""
         posted_match = re.search(r'(\d{2}/\d{2}/\d{4})', row_text)
         posted_date = posted_match.group(1) if posted_match else ""
+
         remainder = row_text
         remainder = re.sub(r'^\d+\s+', '', remainder)
         if tran_id:
@@ -410,6 +424,7 @@ def parse_text_rows(all_rows, bank_key):
             remainder = remainder.replace(a, '', 1)
         remainder = re.sub(r'\d{2}:\d{2}:\d{2}\s*(AM|PM)', '', remainder)
         remainder = re.sub(r'\s+', ' ', remainder).strip().strip('- ')
+
         withdrawal, deposit, balance = "", "", ""
         if len(amounts) >= 3:
             withdrawal, deposit, balance = amounts[-3], amounts[-2], amounts[-1]
@@ -417,6 +432,7 @@ def parse_text_rows(all_rows, bank_key):
             withdrawal, balance = amounts[0], amounts[-1]
         elif len(amounts) == 1:
             balance = amounts[0]
+
         if bank_key == "icici":
             parsed.append({
                 'Sl No': sl_no, 'Tran Id': tran_id, 'Value Date': value_date,
@@ -432,85 +448,110 @@ def parse_text_rows(all_rows, bank_key):
     return pd.DataFrame(parsed)
 
 
+# ──────────────────────────────────────────────
+#  LIGHTWEIGHT EXCEL FORMATTING
+# ──────────────────────────────────────────────
+
 def format_excel(excel_buffer):
     wb = load_workbook(excel_buffer)
     ws = wb.active
-    header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
-    header_font = Font(bold=True, color="FFFFFF", size=11, name="Calibri")
-    data_font = Font(size=10, name="Calibri")
-    thin_border = Border(
+
+    # Pre-create styles (reuse objects to save memory)
+    hdr_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    hdr_font = Font(bold=True, color="FFFFFF", size=11, name="Calibri")
+    dfont = Font(size=10, name="Calibri")
+    border = Border(
         left=Side(style="thin", color="B0B0B0"), right=Side(style="thin", color="B0B0B0"),
         top=Side(style="thin", color="B0B0B0"), bottom=Side(style="thin", color="B0B0B0"),
     )
-    alt_fill = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
-    debit_font = Font(size=10, name="Calibri", color="CC0000")
-    credit_font = Font(size=10, name="Calibri", color="006600")
+    alt = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
+    dr_font = Font(size=10, name="Calibri", color="CC0000")
+    cr_font = Font(size=10, name="Calibri", color="006600")
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    right = Alignment(horizontal="right", vertical="center")
+    left = Alignment(vertical="center", wrap_text=True)
+
     col_map = {}
     for c in range(1, ws.max_column + 1):
         v = ws.cell(row=1, column=c).value
         if v:
             col_map[v] = c
-    dr_kw = ['withdrawal', 'debit', 'dr']
-    cr_kw = ['deposit', 'credit', 'cr']
-    bal_kw = ['balance']
-    dr_cols = {col_map[k] for k in col_map if any(m in k.lower() for m in dr_kw)}
-    cr_cols = {col_map[k] for k in col_map if any(m in k.lower() for m in cr_kw)}
-    bal_cols = {col_map[k] for k in col_map if any(m in k.lower() for m in bal_kw)}
-    money_cols = dr_cols | cr_cols | bal_cols
+
+    dr_cols = {col_map[k] for k in col_map if any(m in k.lower() for m in ['withdrawal', 'debit'])}
+    cr_cols = {col_map[k] for k in col_map if any(m in k.lower() for m in ['deposit', 'credit'])}
+    bal_cols = {col_map[k] for k in col_map if 'balance' in k.lower()}
+    money = dr_cols | cr_cols | bal_cols
+
+    # Headers
     for c in range(1, ws.max_column + 1):
         cell = ws.cell(row=1, column=c)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = thin_border
-    for r in range(2, ws.max_row + 1):
+        cell.fill = hdr_fill
+        cell.font = hdr_font
+        cell.alignment = center
+        cell.border = border
+
+    # Data rows
+    max_row = ws.max_row
+    for r in range(2, max_row + 1):
+        is_even = r % 2 == 0
         for c in range(1, ws.max_column + 1):
             cell = ws.cell(row=r, column=c)
-            cell.border = thin_border
-            cell.alignment = Alignment(vertical="center", wrap_text=True)
-            if r % 2 == 0:
-                cell.fill = alt_fill
-            if c in money_cols:
-                cell.alignment = Alignment(horizontal="right", vertical="center")
+            cell.border = border
+            if is_even:
+                cell.fill = alt
+            if c in money:
+                cell.alignment = right
                 cell.number_format = '#,##0.00'
                 if c in dr_cols and cell.value:
-                    cell.font = debit_font
+                    cell.font = dr_font
                 elif c in cr_cols and cell.value:
-                    cell.font = credit_font
+                    cell.font = cr_font
                 else:
-                    cell.font = data_font
+                    cell.font = dfont
             else:
-                cell.font = data_font
+                cell.alignment = left
+                cell.font = dfont
+
+    # Column widths
     for col_cells in ws.columns:
-        max_len = max((len(str(cell.value)) for cell in col_cells if cell.value), default=8)
-        ws.column_dimensions[col_cells[0].column_letter].width = min(max(max_len + 3, 10), 50)
-    data_last = ws.max_row
-    sr = data_last + 2
-    ws.cell(row=sr, column=1, value="SUMMARY").font = Font(bold=True, size=12, name="Calibri", color="1F4E79")
-    offset = 1
+        mx = max((len(str(cell.value)) for cell in col_cells if cell.value), default=8)
+        ws.column_dimensions[col_cells[0].column_letter].width = min(max(mx + 3, 10), 50)
+
+    # Summary
+    sr = max_row + 2
+    ws.cell(row=sr, column=1, value="SUMMARY").font = Font(bold=True, size=12, color="1F4E79")
+    off = 1
     for ci in dr_cols:
         cl = ws.cell(row=1, column=ci).column_letter
-        ws.cell(row=sr + offset, column=max(1, ci - 1), value="Total Withdrawals:").font = Font(bold=True, size=10)
-        c = ws.cell(row=sr + offset, column=ci)
-        c.value = f"=SUM({cl}2:{cl}{data_last})"
+        ws.cell(row=sr+off, column=max(1, ci-1), value="Total Withdrawals:").font = Font(bold=True, size=10)
+        c = ws.cell(row=sr+off, column=ci)
+        c.value = f"=SUM({cl}2:{cl}{max_row})"
         c.number_format = '#,##0.00'
         c.font = Font(bold=True, size=11, color="CC0000")
-        offset += 1
+        off += 1
     for ci in cr_cols:
         cl = ws.cell(row=1, column=ci).column_letter
-        ws.cell(row=sr + offset, column=max(1, ci - 1), value="Total Deposits:").font = Font(bold=True, size=10)
-        c = ws.cell(row=sr + offset, column=ci)
-        c.value = f"=SUM({cl}2:{cl}{data_last})"
+        ws.cell(row=sr+off, column=max(1, ci-1), value="Total Deposits:").font = Font(bold=True, size=10)
+        c = ws.cell(row=sr+off, column=ci)
+        c.value = f"=SUM({cl}2:{cl}{max_row})"
         c.number_format = '#,##0.00'
         c.font = Font(bold=True, size=11, color="006600")
-        offset += 1
+        off += 1
+
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{ws.cell(row=1, column=ws.max_column).column_letter}{data_last}"
+    ws.auto_filter.ref = f"A1:{ws.cell(row=1, column=ws.max_column).column_letter}{max_row}"
+
     output = io.BytesIO()
     wb.save(output)
+    wb.close()
     output.seek(0)
+    gc.collect()
     return output
 
+
+# ──────────────────────────────────────────────
+#  ROUTES
+# ──────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -524,77 +565,101 @@ def health():
 
 @app.route("/convert", methods=["POST"])
 def convert():
+    tmp_path = None
     try:
         if "pdf_file" not in request.files:
             return jsonify({"error": "No file uploaded"}), 400
+
         pdf_file = request.files["pdf_file"]
         if pdf_file.filename == "":
             return jsonify({"error": "No file selected"}), 400
+
         mode = request.form.get("mode", "text")
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        pdf_file.save(tmp.name)
-        tmp.close()
-        try:
-            if mode == "text":
-                all_rows, bank_key, profile = extract_text_mode(tmp.name)
-                df = parse_text_rows(all_rows, bank_key)
+
+        # Save to temp file
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(tmp_fd)
+        pdf_file.save(tmp_path)
+
+        # Extract
+        if mode == "text":
+            all_rows, bank_key, profile = extract_text_mode(tmp_path)
+            df = parse_text_rows(all_rows, bank_key)
+            del all_rows
+        else:
+            all_data, headers, bank_key, profile = extract_table_mode(tmp_path)
+            if headers and all_data:
+                max_cols = len(headers)
+                normalized = []
+                for row in all_data:
+                    if len(row) < max_cols:
+                        row += [""] * (max_cols - len(row))
+                    elif len(row) > max_cols:
+                        row = row[:max_cols]
+                    normalized.append(row)
+                df = pd.DataFrame(normalized, columns=headers)
+                del all_data, normalized
             else:
-                all_data, headers, bank_key, profile = extract_table_mode(tmp.name)
-                if headers and all_data:
-                    max_cols = len(headers)
-                    normalized = []
-                    for row in all_data:
-                        if len(row) < max_cols:
-                            row += [""] * (max_cols - len(row))
-                        elif len(row) > max_cols:
-                            row = row[:max_cols]
-                        normalized.append(row)
-                    df = pd.DataFrame(normalized, columns=headers)
-                else:
-                    df = pd.DataFrame()
-            # Clean up temp file
-            if os.path.exists(tmp.name):
-                os.unlink(tmp.name)
-            if df.empty or len(df) == 0:
-                return jsonify({"error": "No transactions found. Try switching to Table-based mode."}), 400
-            # Convert money columns
-            money_kws = ['withdrawal', 'deposit', 'balance', 'debit', 'credit', 'amount', 'dr', 'cr']
-            for col in df.columns:
-                if any(kw in col.lower() for kw in money_kws):
-                    df[col] = df[col].apply(
-                        lambda x: float(str(x).replace(',', ''))
-                        if x and re.match(r'^[\d,]+\.?\d*$', str(x).replace(',', '').strip() or '0')
-                        else None
-                    )
-            df = df.dropna(how='all').reset_index(drop=True)
-            # Generate Excel
-            excel_buf = io.BytesIO()
-            df.to_excel(excel_buf, index=False, sheet_name="Bank Statement")
-            excel_buf.seek(0)
-            formatted = format_excel(excel_buf)
-            output_name = pdf_file.filename.replace(".pdf", ".xlsx").replace(".PDF", ".xlsx")
-            response = send_file(
-                formatted,
-                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                as_attachment=True,
-                download_name=output_name,
-            )
-            response.headers["X-Transaction-Count"] = str(len(df))
-            response.headers["X-Bank-Name"] = profile["name"]
-            response.headers["Access-Control-Expose-Headers"] = "X-Transaction-Count, X-Bank-Name"
-            return response
-        except Exception as e:
-            if os.path.exists(tmp.name):
-                os.unlink(tmp.name)
-            raise e
+                df = pd.DataFrame()
+
+        # Clean temp file immediately
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+            tmp_path = None
+
+        gc.collect()
+
+        if df.empty or len(df) == 0:
+            return jsonify({"error": "No transactions found. Try switching to Table-based mode."}), 400
+
+        # Convert money columns
+        money_kws = ['withdrawal', 'deposit', 'balance', 'debit', 'credit', 'amount']
+        for col in df.columns:
+            if any(kw in col.lower() for kw in money_kws):
+                df[col] = df[col].apply(
+                    lambda x: float(str(x).replace(',', ''))
+                    if x and re.match(r'^[\d,]+\.?\d*$', str(x).replace(',', '').strip() or '0')
+                    else None
+                )
+
+        df = df.dropna(how='all').reset_index(drop=True)
+        txn_count = len(df)
+
+        # Generate Excel in memory
+        excel_buf = io.BytesIO()
+        df.to_excel(excel_buf, index=False, sheet_name="Bank Statement")
+        del df
+        gc.collect()
+
+        excel_buf.seek(0)
+        formatted = format_excel(excel_buf)
+        del excel_buf
+        gc.collect()
+
+        output_name = pdf_file.filename.replace(".pdf", ".xlsx").replace(".PDF", ".xlsx")
+        response = send_file(
+            formatted,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            as_attachment=True,
+            download_name=output_name,
+        )
+        response.headers["X-Transaction-Count"] = str(txn_count)
+        response.headers["X-Bank-Name"] = profile["name"]
+        response.headers["Access-Control-Expose-Headers"] = "X-Transaction-Count, X-Bank-Name"
+        return response
+
     except Exception as e:
-        app.logger.error(f"Convert error: {traceback.format_exc()}")
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        gc.collect()
+        app.logger.error(f"Error: {traceback.format_exc()}")
         return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
     print("\n" + "=" * 50)
     print("  PDF to Excel Converter")
-    print("  Open in browser: http://localhost:5000")
+    print(f"  Open in browser: http://localhost:{port}")
     print("=" * 50 + "\n")
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=True, host="0.0.0.0", port=port)
