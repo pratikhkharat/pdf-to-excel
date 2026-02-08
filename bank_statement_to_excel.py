@@ -1,4 +1,4 @@
-from flask import Flask, request, send_file, render_template_string
+from flask import Flask, request, send_file, render_template_string, jsonify
 import pdfplumber
 import pandas as pd
 from openpyxl import load_workbook
@@ -7,6 +7,7 @@ import re
 import io
 import os
 import tempfile
+import traceback
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
@@ -162,7 +163,7 @@ HTML_TEMPLATE = """
         </form>
         <div class="progress-container" id="progress">
             <div class="spinner"></div>
-            <p class="progress-text">Processing your PDF... This may take a moment for large files.</p>
+            <p class="progress-text">Processing your PDF... Large files may take up to 2 minutes.</p>
         </div>
         <div class="result" id="result">
             <h3>&#x2705; Conversion Complete!</h3>
@@ -188,7 +189,7 @@ HTML_TEMPLATE = """
         const form = document.getElementById('uploadForm');
         const progress = document.getElementById('progress');
         const result = document.getElementById('result');
-        const error = document.getElementById('error');
+        const errorDiv = document.getElementById('error');
         fileInput.addEventListener('change', function() {
             if (this.files.length > 0) {
                 const f = this.files[0];
@@ -206,21 +207,40 @@ HTML_TEMPLATE = """
                 opt.classList.add('active');
             });
         });
+        function showError(msg) {
+            progress.style.display = 'none';
+            result.style.display = 'none';
+            errorDiv.style.display = 'block';
+            errorDiv.textContent = 'Error: ' + msg;
+            convertBtn.disabled = false;
+        }
         form.addEventListener('submit', function(e) {
             e.preventDefault();
             convertBtn.disabled = true;
             progress.style.display = 'block';
             result.style.display = 'none';
-            error.style.display = 'none';
+            errorDiv.style.display = 'none';
             const formData = new FormData(form);
             fetch('/convert', { method: 'POST', body: formData })
-                .then(response => {
+                .then(async response => {
+                    const contentType = response.headers.get('content-type') || '';
                     if (!response.ok) {
-                        return response.json().then(data => { throw new Error(data.error); });
+                        if (contentType.includes('application/json')) {
+                            const data = await response.json();
+                            throw new Error(data.error || 'Unknown server error');
+                        } else {
+                            const text = await response.text();
+                            throw new Error('Server error (' + response.status + '). The PDF may be too large or in an unsupported format.');
+                        }
+                    }
+                    if (contentType.includes('application/json')) {
+                        const data = await response.json();
+                        throw new Error(data.error || 'Unknown error');
                     }
                     const txnCount = response.headers.get('X-Transaction-Count') || '?';
-                    const bankName = response.headers.get('X-Bank-Name') || 'Unknown';
-                    return response.blob().then(blob => ({ blob, txnCount, bankName }));
+                    const bankName = response.headers.get('X-Bank-Name') || 'Bank';
+                    const blob = await response.blob();
+                    return { blob, txnCount, bankName };
                 })
                 .then(({ blob, txnCount, bankName }) => {
                     progress.style.display = 'none';
@@ -238,10 +258,7 @@ HTML_TEMPLATE = """
                     convertBtn.disabled = false;
                 })
                 .catch(err => {
-                    progress.style.display = 'none';
-                    error.style.display = 'block';
-                    error.textContent = 'Error: ' + err.message;
-                    convertBtn.disabled = false;
+                    showError(err.message || 'Something went wrong. Please try again.');
                 });
         });
     </script>
@@ -500,65 +517,79 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
+
+
 @app.route("/convert", methods=["POST"])
 def convert():
-    if "pdf_file" not in request.files:
-        return {"error": "No file uploaded"}, 400
-    pdf_file = request.files["pdf_file"]
-    if pdf_file.filename == "":
-        return {"error": "No file selected"}, 400
-    mode = request.form.get("mode", "text")
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    pdf_file.save(tmp.name)
-    tmp.close()
     try:
-        if mode == "text":
-            all_rows, bank_key, profile = extract_text_mode(tmp.name)
-            df = parse_text_rows(all_rows, bank_key)
-        else:
-            all_data, headers, bank_key, profile = extract_table_mode(tmp.name)
-            if headers and all_data:
-                max_cols = len(headers)
-                normalized = []
-                for row in all_data:
-                    if len(row) < max_cols:
-                        row += [""] * (max_cols - len(row))
-                    elif len(row) > max_cols:
-                        row = row[:max_cols]
-                    normalized.append(row)
-                df = pd.DataFrame(normalized, columns=headers)
+        if "pdf_file" not in request.files:
+            return jsonify({"error": "No file uploaded"}), 400
+        pdf_file = request.files["pdf_file"]
+        if pdf_file.filename == "":
+            return jsonify({"error": "No file selected"}), 400
+        mode = request.form.get("mode", "text")
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        pdf_file.save(tmp.name)
+        tmp.close()
+        try:
+            if mode == "text":
+                all_rows, bank_key, profile = extract_text_mode(tmp.name)
+                df = parse_text_rows(all_rows, bank_key)
             else:
-                df = pd.DataFrame()
-        os.unlink(tmp.name)
-        if df.empty or len(df) == 0:
-            return {"error": "No transactions found. Try switching to Table-based mode."}, 400
-        money_kws = ['withdrawal', 'deposit', 'balance', 'debit', 'credit', 'amount', 'dr', 'cr']
-        for col in df.columns:
-            if any(kw in col.lower() for kw in money_kws):
-                df[col] = df[col].apply(
-                    lambda x: float(str(x).replace(',', ''))
-                    if x and re.match(r'^[\d,]+\.?\d*$', str(x).replace(',', '').strip() or '0')
-                    else None
-                )
-        df = df.dropna(how='all').reset_index(drop=True)
-        excel_buf = io.BytesIO()
-        df.to_excel(excel_buf, index=False, sheet_name="Bank Statement")
-        excel_buf.seek(0)
-        formatted = format_excel(excel_buf)
-        output_name = pdf_file.filename.replace(".pdf", ".xlsx").replace(".PDF", ".xlsx")
-        response = send_file(
-            formatted,
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            as_attachment=True,
-            download_name=output_name,
-        )
-        response.headers["X-Transaction-Count"] = str(len(df))
-        response.headers["X-Bank-Name"] = profile["name"]
-        return response
+                all_data, headers, bank_key, profile = extract_table_mode(tmp.name)
+                if headers and all_data:
+                    max_cols = len(headers)
+                    normalized = []
+                    for row in all_data:
+                        if len(row) < max_cols:
+                            row += [""] * (max_cols - len(row))
+                        elif len(row) > max_cols:
+                            row = row[:max_cols]
+                        normalized.append(row)
+                    df = pd.DataFrame(normalized, columns=headers)
+                else:
+                    df = pd.DataFrame()
+            # Clean up temp file
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
+            if df.empty or len(df) == 0:
+                return jsonify({"error": "No transactions found. Try switching to Table-based mode."}), 400
+            # Convert money columns
+            money_kws = ['withdrawal', 'deposit', 'balance', 'debit', 'credit', 'amount', 'dr', 'cr']
+            for col in df.columns:
+                if any(kw in col.lower() for kw in money_kws):
+                    df[col] = df[col].apply(
+                        lambda x: float(str(x).replace(',', ''))
+                        if x and re.match(r'^[\d,]+\.?\d*$', str(x).replace(',', '').strip() or '0')
+                        else None
+                    )
+            df = df.dropna(how='all').reset_index(drop=True)
+            # Generate Excel
+            excel_buf = io.BytesIO()
+            df.to_excel(excel_buf, index=False, sheet_name="Bank Statement")
+            excel_buf.seek(0)
+            formatted = format_excel(excel_buf)
+            output_name = pdf_file.filename.replace(".pdf", ".xlsx").replace(".PDF", ".xlsx")
+            response = send_file(
+                formatted,
+                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                as_attachment=True,
+                download_name=output_name,
+            )
+            response.headers["X-Transaction-Count"] = str(len(df))
+            response.headers["X-Bank-Name"] = profile["name"]
+            response.headers["Access-Control-Expose-Headers"] = "X-Transaction-Count, X-Bank-Name"
+            return response
+        except Exception as e:
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
+            raise e
     except Exception as e:
-        if os.path.exists(tmp.name):
-            os.unlink(tmp.name)
-        return {"error": str(e)}, 500
+        app.logger.error(f"Convert error: {traceback.format_exc()}")
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
